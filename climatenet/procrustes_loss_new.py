@@ -29,6 +29,8 @@ def label_and_extract_boundaries(binary_mask):
     where boundary_points is an (N,2) array of [row,col].
     """
     labeled = skimage.measure.label(binary_mask, connectivity=2)
+    labeled = labeled.squeeze()
+    print(f'labeled shape : {labeled.shape}')
     boundaries = []
     for region_id in range(1, labeled.max() + 1):
         # A mask for just this object
@@ -236,7 +238,7 @@ class ProcrustesDTLoss(_Loss):
                 Incompatible values.
 
         """
-        super(HausdorffDTLoss, self).__init__(reduction=LossReduction(reduction).value)
+        super(ProcrustesDTLoss, self).__init__(reduction=LossReduction(reduction).value)
         if other_act is not None and not callable(other_act):
             raise TypeError(f"other_act must be None or callable but is {type(other_act).__name__}.")
         if int(sigmoid) + int(softmax) > 1:
@@ -295,6 +297,12 @@ class ProcrustesDTLoss(_Loss):
             # A) Binarize predicted probability
             pred_mask = (pred_proba[batch_idx] >= 0.5)
             true_mask = gt_mask[batch_idx]
+            
+            if pred_mask.is_cuda:
+                pred_mask = pred_mask.cpu().numpy()
+            if true_mask.is_cuda:
+                true_mask = true_mask.cpu().numpy()
+            
         
         
         # B) Extract boundaries
@@ -339,6 +347,9 @@ class ProcrustesDTLoss(_Loss):
             dt_final_custom[unassigned_pred_mask] = penalty_value
         
             procrustes_field[batch_idx] = dt_final_custom
+            
+            
+        procrustes_field = torch.from_numpy(procrustes_field).to('cuda')
             
         
         return(procrustes_field)

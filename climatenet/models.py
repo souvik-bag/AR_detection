@@ -330,7 +330,7 @@ import pathlib
 from monai.losses import HausdorffDTLoss, DiceLoss, GeneralizedDiceLoss, DiceFocalLoss, GeneralizedDiceFocalLoss, FocalLoss
 from monai.networks.utils import one_hot
 from climatenet.procrustes_loss import ProcrustesLoss
-
+from climatenet.procrustes_loss_new import ProcrustesDTLoss
 
 class CGNet:
     """
@@ -452,13 +452,20 @@ class CGNet:
             dataset,
             batch_size=self.config.train_batch_size,
             collate_fn=collate,
-            num_workers=2,
+            num_workers=8,
             shuffle=True,
         )
 
         # Initialize the loss functions.
         # For Hausdorff, we will supply one-hot labels ourselves.
-        hausdorff_loss_fn = HausdorffDTLoss(
+        # hausdorff_loss_fn = HausdorffDTLoss(
+        #     softmax=True,
+        #     to_onehot_y=False,
+        #     include_background=False,
+        #     reduction="mean"
+        # )
+        
+        procrustes_loss_fn = ProcrustesDTLoss(
             softmax=True,
             to_onehot_y=False,
             include_background=False,
@@ -521,7 +528,7 @@ class CGNet:
 
                 # # Compute losses:
                 # # Hausdorff loss uses our precomputed one-hot target.
-                loss_hausdorff = hausdorff_loss_fn(logits, target_onehot)
+                loss_procrustes = procrustes_loss_fn(logits, target_onehot)
                 # # Dice loss uses the original labels (DiceLoss will one-hot encode internally).
                 # # squeeze to get [B, H, W]
                 # loss = dice_loss_fn(logits, target_onehot)
@@ -534,8 +541,8 @@ class CGNet:
                 # predictions = torch.argmax(logits, dim=1)  # shape: [B, H, W]
                 # aggregate_cm += get_cm(predictions, labels.squeeze(1), 3)
 
-                epoch_loader.set_description(f"Loss: {loss_hausdorff.item():.4f}")
-                loss_hausdorff.backward()
+                epoch_loader.set_description(f"Loss: {loss_procrustes.item():.4f}")
+                loss_procrustes.backward()
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
@@ -677,7 +684,10 @@ class CGNet:
 
             with torch.no_grad():
                 # Get raw outputs and then apply softmax for probabilities
-                outputs = torch.softmax(self.network(features), dim=1)
+                # outputs = torch.softmax(self.network(features), dim=1)
+                outputs = self.network(features)
+                
+                
                 print(f"Output shape : {outputs.shape}")
             # preds = torch.argmax(outputs, dim=1).cpu().numpy()
             preds = outputs.cpu().numpy()
