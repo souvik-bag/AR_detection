@@ -330,7 +330,7 @@ import pathlib
 from monai.losses import HausdorffDTLoss, DiceLoss, GeneralizedDiceLoss, DiceFocalLoss, GeneralizedDiceFocalLoss, FocalLoss
 from monai.networks.utils import one_hot
 from climatenet.procrustes_loss import ProcrustesLoss
-from climatenet.procrustes_loss_new import ProcrustesDTLoss
+from climatenet.procrustes_loss_new import ProcrustesLossBag
 
 class CGNet:
     """
@@ -452,7 +452,7 @@ class CGNet:
             dataset,
             batch_size=self.config.train_batch_size,
             collate_fn=collate,
-            num_workers=8,
+            num_workers=2,
             shuffle=True,
         )
 
@@ -522,13 +522,13 @@ class CGNet:
                 # Forward pass: get raw logits with shape [B, C, H, W]
                 logits = self.network(features)
                 # outputs = torch.softmax(self.network(features), 1)
-                # criterion = nn.CrossEntropyLoss()
-                # loss = criterion(logits, labels)
+                criterion = nn.CrossEntropyLoss()
+                loss = criterion(logits, labels)
                 
 
                 # # Compute losses:
                 # # Hausdorff loss uses our precomputed one-hot target.
-                loss_procrustes = procrustes_loss_fn(logits, target_onehot)
+                # loss_procrustes = procrustes_loss_fn(logits, target_onehot)
                 # # Dice loss uses the original labels (DiceLoss will one-hot encode internally).
                 # # squeeze to get [B, H, W]
                 # loss = dice_loss_fn(logits, target_onehot)
@@ -541,8 +541,8 @@ class CGNet:
                 # predictions = torch.argmax(logits, dim=1)  # shape: [B, H, W]
                 # aggregate_cm += get_cm(predictions, labels.squeeze(1), 3)
 
-                epoch_loader.set_description(f"Loss: {loss_procrustes.item():.4f}")
-                loss_procrustes.backward()
+                epoch_loader.set_description(f"Loss: {loss.item():.4f}")
+                loss.backward()
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
@@ -589,11 +589,12 @@ class CGNet:
         #     include_background=False,
         #     reduction="mean"
         # )
-
+        criterion = ProcrustesLossBag(alpha=2.0)
+        # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     # Initialize the Procrustes loss function (applied on AR channel only).
-        procrustes_loss_fn = ProcrustesLoss(
-        threshold=0.5, allow_scaling=False, penalty_constant=500
-    )
+    #     procrustes_loss_fn = ProcrustesLossBag(
+    #     threshold=0.5, allow_scaling=False, penalty_constant=500
+    # )
 
         for epoch in range(1, self.config.epochs + 1):
             print(f"Epoch {epoch}:")
@@ -641,15 +642,16 @@ class CGNet:
             # For Procrustes loss, compute it only for AR:
             # Compute predicted probabilities via softmax.
                 pred_probs = torch.softmax(logits, dim=1)  # shape: [B, 2, H, W]
-                print(f'pred_probs shape: {pred_probs.shape}')
+                # print(f'pred_probs shape: {pred_probs.shape}')
             # Extract AR channel (channel index 1).
                 pred_proba_ar = pred_probs[:, 1:2, ...]  # shape: [B, 1, H, W]
+                print(f'pred_probs_ar shape: {pred_proba_ar.shape}')
             # Create a binary ground truth mask for AR (pixels==1 indicate AR).
                 gt_ar = (labels == 1).float()  # shape: [B, H, W]
                 gt_ar = gt_ar[:, None, ...]  # shape: [B, 1, H, W]
-
+                print(f'gt_ar shape: {gt_ar.shape}')
             # Compute Procrustes loss.
-                loss_procrustes = procrustes_loss_fn(pred_proba_ar, gt_ar)
+                loss_procrustes = criterion(pred_proba_ar, gt_ar)
 
             # Combine losses.
                 # total_loss =   loss_jaccard   +  0.01 * loss_procrustes
@@ -779,17 +781,17 @@ class CGNet:
         self.config.save(path.join(save_path, "config_new.json"))
         torch.save(self.network.state_dict(), path.join(save_path, "weights_new.pth"))
 
-    def load_model(self, model_path: str):
+    def load_model(self, weight_path: str, config_path : str):
         """
         Load a model. While this can easily be done using the normal constructor, this might make the code more readable -
         we instantly see that we're loading a model, and don't have to look at the arguments of the constructor first.
         """
-        self.config = Config(path.join(model_path, "config_new.json"))
+        self.config = Config(config_path)
         self.network = CGNetModule(
             classes=len(self.config.labels), channels=len(list(self.config.fields))
         ).to(self.device)
         self.network.load_state_dict(
-            torch.load(path.join(model_path, "weights_new.pth"), weights_only=True)
+            torch.load(weight_path, weights_only=True)
         )
 
 

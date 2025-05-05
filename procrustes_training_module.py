@@ -17,13 +17,13 @@ from climatenet.visualize_events import visualize_events
 import torch
 import numpy as np
 from os import path
-
-config = Config('/home/sbk29/data/ClimateNet/climatenet/config_new.json')
+from climatenet.procrustes_loss_new import ProcrustesLossBag
+config = Config("/home/sbk29/data/github_AR/AR_detection/climatenet/config_new.json")
 # print(config.num_classes)  # should be 3
 cgnet = CGNet(config)
 
 train_path = '/home/sbk29/data/AR/'
 train_dataset = ClimateDatasetLabeled(path.join(train_path, 'train'), config)
-cgnet.train(train_dataset)
+cgnet.train_procrustes(train_dataset)
 
 cgnet.save_model('/home/sbk29/data/ClimateNet/climatenet/weights/')
