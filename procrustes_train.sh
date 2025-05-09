@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1 
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --job-name=procrustes_train
 #SBATCH --output=procrustes_train%j.out
 #SBATCH --error=procrustes_train%j.err

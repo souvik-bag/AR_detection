@@ -637,7 +637,7 @@ class CGNet:
                 # loss_ce = loss_fn(logits, labels)
 
             # Compute Dice loss.
-                # loss_jaccard = jaccard_loss(logits, labels)
+                loss_jaccard = jaccard_loss(logits, labels)
 
             # For Procrustes loss, compute it only for AR:
             # Compute predicted probabilities via softmax.
@@ -654,7 +654,7 @@ class CGNet:
                 loss_procrustes = criterion(pred_proba_ar, gt_ar)
 
             # Combine losses.
-                # total_loss =   loss_jaccard   +  0.01 * loss_procrustes
+                total_loss =   loss_jaccard   +  (0.01 * loss_procrustes)
 
             # # Update training confusion matrix.
             # # (Assumes get_cm() handles 2 classes correctly.)
@@ -662,7 +662,7 @@ class CGNet:
             #     aggregate_cm += get_cm(predictions, labels.squeeze(1), 2)
 
             #     epoch_loader.set_description(f"Loss: {total_loss.item():.4f}")
-                loss_procrustes.backward()
+                total_loss.backward()
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 

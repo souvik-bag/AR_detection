@@ -4,7 +4,7 @@
     "lr": 0.001,
     "train_batch_size": 8,
     "pred_batch_size": 8,
-    "epochs": 1,
+    "epochs": 30,
     "fields": {
         "TMQ": {
             "mean": 19.21859,
