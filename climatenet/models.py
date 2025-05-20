@@ -654,7 +654,8 @@ class CGNet:
                 loss_procrustes = criterion(pred_proba_ar, gt_ar)
 
             # Combine losses.
-                total_loss =   loss_jaccard   +  (0.01 * loss_procrustes)
+                # total_loss =   loss_jaccard   +  (0.01 * loss_procrustes)
+                total_loss = loss_procrustes
 
             # # Update training confusion matrix.
             # # (Assumes get_cm() handles 2 classes correctly.)

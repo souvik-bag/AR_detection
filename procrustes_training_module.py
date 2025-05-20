@@ -26,4 +26,4 @@ train_path = '/home/sbk29/data/AR/'
 train_dataset = ClimateDatasetLabeled(path.join(train_path, 'train'), config)
 cgnet.train_procrustes(train_dataset)
 
-cgnet.save_model('/home/sbk29/data/ClimateNet/climatenet/weights/')
+cgnet.save_model('/home/sbk29/data/github_AR/AR_detection/climatenet/weights/')
