@@ -60,8 +60,11 @@ class ARMultiAnnDataset(torch.utils.data.Dataset):
             for v in self.var_names
         ]
         x = torch.stack(vars_arr).float()               # [C, H, W]
+        
+        raw = torch.as_tensor(ds["LABELS"].values).squeeze()
+        y   = (raw == 2).float().unsqueeze(0) 
 
-        y = torch.as_tensor(ds["LABELS"].values).squeeze().unsqueeze(0).float()
+        # y = torch.as_tensor(ds["LABELS"].values).squeeze().unsqueeze(0).float()
         ds.close()
         return x, y
 
@@ -74,7 +77,7 @@ class ARMultiAnnDataset(torch.utils.data.Dataset):
             x, y = self._load_nc(p)
             if x_vars is None: x_vars = x
             y_list.append(y)
-        y_cons = torch.stack(y_list).mean(0, keepdim=True)
+        y_cons = torch.stack(y_list).mean(0)
         return x_vars, y_list, y_cons      # variable-length list
 
 def collate_var(batch):
@@ -150,52 +153,117 @@ class ARSegNet(nn.Module):
 # 3. training
 # -------------------------------------------------------------------------
 
+# def main(cfg):
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+#     ds   = ARMultiAnnDataset(cfg.data_dir, cfg.vars)
+#     loader = DataLoader(ds, batch_size=cfg.bs, shuffle=True,
+#                         num_workers=cfg.workers, collate_fn=collate_var,
+#                         pin_memory=True)
+#     net  = ARSegNet(len(cfg.vars)).to(device)
+#     opt  = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
+#     sched= torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
+
+#     bce  = nn.BCEWithLogitsLoss()
+#     scaler = torch.cuda.amp.GradScaler()
+
+#     logdir = Path(cfg.out)
+#     logdir.mkdir(parents=True, exist_ok=True)
+
+#     for epoch in range(cfg.epochs):
+#         net.train()
+#         epoch_loss, epoch_dice = 0.0, 0.0
+#         pbar = tqdm(loader, desc=f"Epoch {epoch:02d}", ncols=100)
+#         for x_vars, y_lists, y_cons in pbar:
+#             x_vars, y_cons = x_vars.to(device), y_cons.to(device)
+
+#             with torch.cuda.amp.autocast():
+#                 logits = net(x_vars, y_lists)
+#                 loss   = bce(logits, y_cons) + 0.5 * (1 - dice_coeff(logits, y_cons))
+#             scaler.scale(loss).backward()
+#             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+#             scaler.step(opt); scaler.update(); opt.zero_grad()
+
+#             with torch.no_grad():
+#                 d = dice_coeff(logits, y_cons)
+#             epoch_loss += loss.item()*x_vars.size(0)
+#             epoch_dice += d*x_vars.size(0)
+#             pbar.set_postfix(loss=f"{loss.item():.3f}", dice=f"{d:.3f}")
+
+#         sched.step()
+#         N = len(ds)
+#         print(f"Epoch {epoch:02d}  mean loss {epoch_loss/N:.4f} | mean Dice {epoch_dice/N:.4f}")
+
+#         # checkpoint
+#         torch.save({"model": net.state_dict(),
+#                     "opt": opt.state_dict(),
+#                     "epoch": epoch},
+#                    logdir / f"ckpt_{epoch:02d}.pt")
+
+# -------------------------------------------------------------------------
+# 3. training  – with dtype-safe AMP
+# -------------------------------------------------------------------------
 def main(cfg):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ds   = ARMultiAnnDataset(cfg.data_dir, cfg.vars)
-    loader = DataLoader(ds, batch_size=cfg.bs, shuffle=True,
-                        num_workers=cfg.workers, collate_fn=collate_var,
-                        pin_memory=True)
-    net  = ARSegNet(len(cfg.vars)).to(device)
-    opt  = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
-    sched= torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
+    ds      = ARMultiAnnDataset(cfg.data_dir, cfg.vars)
+    loader  = DataLoader(ds, batch_size=cfg.bs, shuffle=True,
+                         num_workers=cfg.workers, collate_fn=collate_var,
+                         pin_memory=True)
 
-    bce  = nn.BCEWithLogitsLoss()
-    scaler = torch.cuda.amp.GradScaler()
+    net     = ARSegNet(len(cfg.vars)).to(device)
+    opt     = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    sched   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
+    bce     = nn.BCEWithLogitsLoss()
 
+    scaler  = torch.amp.GradScaler(device="cuda")        # new API
     logdir = Path(cfg.out)
     logdir.mkdir(parents=True, exist_ok=True)
 
+
     for epoch in range(cfg.epochs):
         net.train()
-        epoch_loss, epoch_dice = 0.0, 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch:02d}", ncols=100)
-        for x_vars, y_lists, y_cons in pbar:
+        epoch_loss = epoch_dice = 0.0
+        for x_vars, y_lists, y_cons in tqdm(loader, desc=f"Epoch {epoch:02d}", ncols=100):
             x_vars, y_cons = x_vars.to(device), y_cons.to(device)
 
-            with torch.cuda.amp.autocast():
-                logits = net(x_vars, y_lists)
-                loss   = bce(logits, y_cons) + 0.5 * (1 - dice_coeff(logits, y_cons))
+            with torch.amp.autocast(device_type="cuda"):
+                # ---- annotate branch (cast masks) ----
+                ann_feats = []
+                for y_list in y_lists:
+                    y_gpu = [m.to(device, dtype=x_vars.dtype) for m in y_list]
+                    ann_feats.append(net.ann_enc(y_gpu))      # 1,c_ann,H,W
+                ann_feats = torch.cat(ann_feats, 0)           # B,c_ann,H,W
+
+                var_feats = net.var_unet(x_vars)
+                logits    = net.head(torch.cat([var_feats, ann_feats], 1))
+                loss      = bce(logits, y_cons) + 0.5 * (1 - dice_coeff(logits, y_cons))
+
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             scaler.step(opt); scaler.update(); opt.zero_grad()
 
             with torch.no_grad():
                 d = dice_coeff(logits, y_cons)
-            epoch_loss += loss.item()*x_vars.size(0)
-            epoch_dice += d*x_vars.size(0)
-            pbar.set_postfix(loss=f"{loss.item():.3f}", dice=f"{d:.3f}")
+
+            epoch_loss += loss.item() * x_vars.size(0)
+            epoch_dice += d * x_vars.size(0)
 
         sched.step()
         N = len(ds)
         print(f"Epoch {epoch:02d}  mean loss {epoch_loss/N:.4f} | mean Dice {epoch_dice/N:.4f}")
-
+        
         # checkpoint
         torch.save({"model": net.state_dict(),
                     "opt": opt.state_dict(),
                     "epoch": epoch},
                    logdir / f"ckpt_{epoch:02d}.pt")
+
+
+
+
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
