@@ -25,4 +25,7 @@ conda activate turbulence
 # python procrustes_training_module.py
 
 # ── 2. launch Python training ────────────────────────────────────────────────
-python train_unet_hpc.py --data-dir /home/sbk29/data/AR/train --epochs 50 --vars     TMQ
+python train_unet_hpc.py \
+       --data-dir /home/sbk29/data/AR/train \
+       --epochs   5 \
+       --vars     TMQ

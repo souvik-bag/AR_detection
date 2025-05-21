@@ -121,18 +121,50 @@ class VarUNet(nn.Module):                         # ← standard UNet encoder-de
         x  = self.conv2(torch.cat([self.up2(x),  x2], 1))
         x  = self.conv1(torch.cat([self.up1(x),  x1], 1))
         return x                              # (B, base, H, W)
+# Original
+# class AnnEncoder(nn.Module):
+#     """Shared CNN → mean-pool over variable annotators."""
+#     def __init__(self, c_out=24):
+#         super().__init__()
+#         self.enc = nn.Sequential(
+#             nn.Conv2d(1, 12, 3, 1, 1), nn.ReLU(True),
+#             nn.Conv2d(12, c_out, 3, 1, 1), nn.ReLU(True)
+#         )
+#     def forward(self, y_list: List[torch.Tensor]):   # len = N_i
+#         feats = [self.enc(y.unsqueeze(0)) for y in y_list]   # N, c_out, H, W
+#         return torch.stack(feats).mean(0)                   # 1, c_out, H, W
 
 class AnnEncoder(nn.Module):
-    """Shared CNN → mean-pool over variable annotators."""
     def __init__(self, c_out=24):
         super().__init__()
+        self.c_out = c_out
         self.enc = nn.Sequential(
-            nn.Conv2d(1, 12, 3, 1, 1), nn.ReLU(True),
-            nn.Conv2d(12, c_out, 3, 1, 1), nn.ReLU(True)
+            nn.Conv2d(1, 12, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(12, c_out, 3, padding=1), nn.ReLU(True)
         )
-    def forward(self, y_list: List[torch.Tensor]):   # len = N_i
-        feats = [self.enc(y.unsqueeze(0)) for y in y_list]   # N, c_out, H, W
-        return torch.stack(feats).mean(0)                   # 1, c_out, H, W
+
+    def forward(self, y_list):
+        if len(y_list) == 0:                             # ← ADD THIS BLOCK
+            # return a tensor of zeros shaped like a single feature map
+            # (1, c_out, H, W) – but H,W unknown here, so create a dummy
+            return None                                  # signal “empty”
+        feats = [self.enc(y.unsqueeze(0)) for y in y_list]
+        return torch.stack(feats).mean(0)                # (1, c_out, H, W)
+
+# class ARSegNet(nn.Module):
+#     def __init__(self, c_vars: int, base=48, c_ann=24):
+#         super().__init__()
+#         self.var_unet = VarUNet(c_vars, base)
+#         self.ann_enc  = AnnEncoder(c_ann)
+#         self.head     = nn.Sequential(
+#             nn.Conv2d(base + c_ann, base, 3, 1, 1), nn.ReLU(True),
+#             nn.Conv2d(base, 1, 1)                        # logits
+#         )
+#     def forward(self, x_vars, y_lists):
+#         B = x_vars.size(0)
+#         f_var = self.var_unet(x_vars)                    # [B,base,H,W]
+#         f_ann = torch.cat([self.ann_enc(lst) for lst in y_lists], 0)  # [B,c_ann,H,W]
+#         return self.head(torch.cat([f_var, f_ann], 1))   # [B,1,H,W]
 
 class ARSegNet(nn.Module):
     def __init__(self, c_vars: int, base=48, c_ann=24):
@@ -140,14 +172,30 @@ class ARSegNet(nn.Module):
         self.var_unet = VarUNet(c_vars, base)
         self.ann_enc  = AnnEncoder(c_ann)
         self.head     = nn.Sequential(
-            nn.Conv2d(base + c_ann, base, 3, 1, 1), nn.ReLU(True),
-            nn.Conv2d(base, 1, 1)                        # logits
+            nn.Conv2d(base + c_ann, base, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(base, 1, 1)                      # logits
         )
+
     def forward(self, x_vars, y_lists):
-        B = x_vars.size(0)
-        f_var = self.var_unet(x_vars)                    # [B,base,H,W]
-        f_ann = torch.cat([self.ann_enc(lst) for lst in y_lists], 0)  # [B,c_ann,H,W]
-        return self.head(torch.cat([f_var, f_ann], 1))   # [B,1,H,W]
+        """
+        x_vars  : Tensor  [B, c_vars, H, W]
+        y_lists : list length B, each element is a list of Nᵢ masks (may be 0)
+        """
+        B, _, H, W = x_vars.shape
+        f_var = self.var_unet(x_vars)                  # [B, base, H, W]
+
+        f_ann = []                                     # will collect B tensors
+        for lst in y_lists:
+            feat = self.ann_enc(lst)                   # None or [1, c_ann, H, W]
+            if feat is None:                           # ← empty annotator list
+                feat = x_vars.new_zeros(1,             # create zeros on-device,
+                                        self.ann_enc.c_out,
+                                        H, W)          # same dtype, same H,W
+            f_ann.append(feat)
+
+        f_ann = torch.cat(f_ann, dim=0)                # [B, c_ann, H, W]
+        fused = torch.cat([f_var, f_ann], dim=1)       # [B, base+c_ann, H, W]
+        return self.head(fused)                        # [B, 1, H, W]  logits
 
 # -------------------------------------------------------------------------
 # 3. training
@@ -219,6 +267,7 @@ def main(cfg):
     scaler  = torch.amp.GradScaler(device="cuda")        # new API
     logdir = Path(cfg.out)
     logdir.mkdir(parents=True, exist_ok=True)
+    MASK_DROP_P = 0.5 
 
 
     for epoch in range(cfg.epochs):
@@ -226,6 +275,8 @@ def main(cfg):
         epoch_loss = epoch_dice = 0.0
         for x_vars, y_lists, y_cons in tqdm(loader, desc=f"Epoch {epoch:02d}", ncols=100):
             x_vars, y_cons = x_vars.to(device), y_cons.to(device)
+            if torch.rand(1).item() < MASK_DROP_P:
+                y_lists = [[] for _ in y_lists]     # <- makes annotator branch get zeros
 
             with torch.amp.autocast(device_type="cuda"):
                 # ---- annotate branch (cast masks) ----
