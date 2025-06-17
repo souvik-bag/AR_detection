@@ -12,6 +12,7 @@ def parse():
     p.add_argument("--data-dir", required=True)
     p.add_argument("--epochs",   type=int, default=25)
     p.add_argument("--vars",     nargs="+", default=["TMQ"])
+    p.add_argument("--label-dir", required=True)
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -20,7 +21,8 @@ if __name__ == "__main__":
     cmd = ["python", "train_model.py",
            "--data-dir", args.data_dir,
            "--epochs",   str(args.epochs),
-           "--vars",    *args.vars]
+           "--vars",    *args.vars,
+           "--label-dir",args.label_dir]
 
     print("⇢ Launching:", " ".join(cmd), flush=True)
     # propagate exit code (fails job if training crashes)

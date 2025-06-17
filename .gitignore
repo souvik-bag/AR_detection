@@ -1,0 +1,5 @@
+climatenet/*.pth
+u_net/ds_results
+u_net/runs
+synthetic_data
+runs

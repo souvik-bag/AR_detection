@@ -1,13 +1,14 @@
 import argparse, math, re, glob, os
 from pathlib import Path
-from typing   import List, Tuple
+from typing   import List, Tuple, Optional
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import xarray as xr
 from tqdm import tqdm
-from unet_block import UNet   
-from loss import jaccard_loss
-from procrustes_loss_new import ProcrustesLossBag
+from u_net.unet_block import UNet   
+from u_net.loss import jaccard_loss
+from u_net.procrustes_loss_new import ProcrustesLossBag
+import numpy as np
 
 # -------------------------------------------------------------------------
 # 0. utilities
@@ -24,55 +25,98 @@ def dice_coeff(logits: torch.Tensor, targets: torch.Tensor, eps=1e-6) -> float:
 # -------------------------------------------------------------------------
 # 1. dataset  (exactly the class you already have, shortened here)
 # -------------------------------------------------------------------------
-
 FNAME_RE = re.compile(r"data-(\d{4}-\d{2}-\d{2})-.*?_(\d+)\.nc$")
+POST_RE  = re.compile(r"posterior_map_(\d+)\.npy$")
 
 class ARMultiAnnDataset(torch.utils.data.Dataset):
-    def __init__(self, root: str | Path, var_names: List[str]):
+    def __init__(
+        self,
+        root:        str | Path,
+        var_names:   List[str],
+        gt_npy_root: Optional[str | Path],
+    ):
         super().__init__()
         self.root, self.var_names = Path(root), var_names
 
+        # ——— 1) build the list of dates → annotator files ———
         by_date = {}
-        for f in glob.glob(str(self.root / "*.nc")):
-            m = FNAME_RE.search(Path(f).name)
-            if m:
-                by_date.setdefault(m.group(1), {})[int(m.group(2))] = Path(f)
+        for f in self.root.glob("*.nc"):
+            m = FNAME_RE.search(f.name)
+            if not m:
+                continue
+            date, ann_id = m.group(1), int(m.group(2))
+            by_date.setdefault(date, {})[ann_id] = f
 
+        if not by_date:
+            raise RuntimeError(f"No .nc files found in {self.root!r}")
+        # sorted list of (date, {ann_id: Path})
         self.samples = sorted(by_date.items())
-        self.real_max_ann = max(len(d) for _,d in self.samples)
+        self.real_max_ann = max(len(d) for _, d in self.samples)
+
+        # ——— 2) collect your posterior_map_{k}.npy files ———
+        if gt_npy_root is not None:
+            npy_root = Path(gt_npy_root)
+            candidates = []
+            for p in npy_root.glob("posterior_map_*.npy"):
+                mm = POST_RE.search(p.name)
+                if mm:
+                    idx = int(mm.group(1))
+                    candidates.append((idx, p))
+            # sort by that integer index
+            candidates.sort(key=lambda x: x[0])
+            if len(candidates) != len(self.samples):
+                raise ValueError(
+                    f"Found {len(candidates)} posterior_map_*.npy but {len(self.samples)} dates"
+                )
+            # unzip into parallel lists
+            self.npy_indices, self.npy_files = zip(*candidates)
+        else:
+            self.npy_indices = None
+            self.npy_files   = [None] * len(self.samples)
 
     def _load_nc(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
         ds = xr.open_dataset(path, engine="netcdf4")
-
-        # squeeze() drops ANY singleton dimension, e.g. the leading "time=1"
-        vars_arr = [
-            torch.as_tensor(ds[v].values).squeeze()     # (H, W) after squeeze
+        x = torch.stack([
+            torch.as_tensor(ds[v].values).squeeze()
             for v in self.var_names
-        ]
-        x = torch.stack(vars_arr).float()               # [C, H, W]
-        
+        ]).float()               # [C, H, W]
         raw = torch.as_tensor(ds["LABELS"].values).squeeze()
-        y   = (raw == 2).float().unsqueeze(0) 
-
-        # y = torch.as_tensor(ds["LABELS"].values).squeeze().unsqueeze(0).float()
+        y   = (raw == 2).float().unsqueeze(0)  # [1, H, W]
         ds.close()
         return x, y
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        _, ann_map = self.samples[idx]
+        date, ann_map = self.samples[idx]
+
+        # A) load annotator masks
         x_vars, y_list = None, []
         for p in ann_map.values():
             x, y = self._load_nc(p)
-            if x_vars is None: x_vars = x
+            if x_vars is None:
+                x_vars = x
             y_list.append(y)
-        y_cons = torch.stack(y_list).mean(0)
-        return x_vars, y_list, y_cons      # variable-length list
+
+        # B) compute soft consensus
+        y_means = torch.stack(y_list).mean(0)
+        y_cons = torch.stack(y_list).mean(0)  # [1, H, W]
+
+        # C) override with ground-truth npy if available
+        npy_path = self.npy_files[idx]
+        if npy_path is not None:
+            arr = np.load(npy_path)        # shape [H,W] or [1,H,W]
+            if arr.ndim == 2:
+                arr = arr[None]
+            y_cons = torch.from_numpy(arr).float()
+
+        return x_vars, y_list, y_cons, y_means
 
 def collate_var(batch):
-    xs, y_lists, y_cons = zip(*batch)
-    return torch.stack(xs), list(y_lists), torch.stack(y_cons)
+    xs, y_lists, y_cons, y_means = zip(*batch)
+    return torch.stack(xs), list(y_lists), torch.stack(y_cons), torch.stack(y_means)
+
 
 
 # ───────────────────────────────── MODEL DEFINITIONS ─────────────────────────────────
@@ -224,7 +268,7 @@ def main(cfg):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ── dataset + 80/20 split (keeps y_cons) ───────────────────────────────────
-    full_ds  = ARMultiAnnDataset(cfg.data_dir, ["TMQ"])
+    full_ds  = ARMultiAnnDataset(cfg.data_dir, ["TMQ"], cfg.label_dir)
     val_frac = 0.20
     n_val    = int(len(full_ds) * val_frac)
     n_train  = len(full_ds) - n_val
@@ -243,23 +287,24 @@ def main(cfg):
     opt    = torch.optim.AdamW(seg.parameters(), lr=1e-4)
     bce    = nn.BCEWithLogitsLoss()
     scaler = torch.amp.GradScaler(device ="cuda")
-    criterion = ProcrustesLossBag(alpha=2.0)
+    criterion = ProcrustesLossBag(alpha=1.0)
 
     # ── epoch loop ────────────────────────────────────────────────────────────
     for epoch in range(cfg.epochs):
         # ---- training ----
         seg.train(); tr_loss = 0.0
-        for x_vars, _, y_cons in tqdm(train_dl, desc=f"Train {epoch:02d}", ncols=100):
-            x_vars, y_cons = x_vars.to(device), y_cons.to(device)
+        for x_vars, _, y_cons,y_means in tqdm(train_dl, desc=f"Train {epoch:02d}", ncols=100):
+            x_vars, y_cons, y_means= x_vars.to(device), y_cons.to(device), y_means.to(device)
 
             with torch.amp.autocast(device_type="cuda"):
                 logits = seg(x_vars)
                 # loss   = bce(logits, y_cons) + 0.5*(1 - dice_coeff(logits, y_cons))
-                loss_jaccard = jaccard_loss(logits, y_cons)
+                loss_jaccard = jaccard_loss(logits, y_means)
                 pred_probs = torch.sigmoid(logits) 
                 # print(f"pred_probs shape : {pred_probs.shape}")
                 # print(f"y_con shape : {y_cons.shape}")
-                loss_procrustes = criterion(pred_probs, y_cons)
+                loss_procrustes = criterion(pred_probs, y_means)
+                # loss_bce = bce(logits, y_means)
                 loss = loss_jaccard + (0.1*loss_procrustes)
 
             scaler.scale(loss).backward()
@@ -269,18 +314,19 @@ def main(cfg):
         # ---- validation ----
         seg.eval(); val_loss = val_dice = 0.0
         with torch.no_grad(), torch.amp.autocast(device_type="cuda"):
-            for x_vars, _, y_cons in val_dl:
-                x_vars, y_cons = x_vars.to(device), y_cons.to(device)
+            for x_vars, _, y_cons, y_means in val_dl:
+                x_vars, y_cons, y_means = x_vars.to(device), y_cons.to(device), y_means.to(device)
                 logits = seg(x_vars)
                 pred_probs = torch.sigmoid(logits) 
                 # loss   = bce(logits, y_cons) + 0.5*(1 - dice_coeff(logits, y_cons))
-                loss_jaccard = jaccard_loss(logits, y_cons)
-                loss_procrustes = criterion(pred_probs, y_cons)
+                loss_jaccard = jaccard_loss(logits, y_means)
+                loss_procrustes = criterion(pred_probs, y_means)
+                # loss_bce = bce(logits, y_means)
                 loss = loss_jaccard + (0.1*loss_procrustes)
                 
                 
                 val_loss += loss.item() * x_vars.size(0)
-                val_dice += dice_coeff(logits, y_cons) * x_vars.size(0)
+                val_dice += dice_coeff(logits, y_means) * x_vars.size(0)
 
         # ---- epoch metrics ----
         tr_loss /= n_train
@@ -291,12 +337,14 @@ def main(cfg):
 
     #── save checkpoint ───────────────────────────────────────────────────────
     out_dir = Path(cfg.out); out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(seg.state_dict(), out_dir / "unet_Jaccard_PL.pt")
+    torch.save(seg.state_dict(), out_dir / "unet_PL_mean_Jaccard.pt")
     
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--label-dir", required=True)
+    
     parser.add_argument("--vars", nargs="+", required=True,
                         help="16 variable names present in every .nc file")
     parser.add_argument("--epochs", type=int, default=20)
@@ -307,3 +355,4 @@ if __name__ == "__main__":
     cfg = parser.parse_args()
     main(cfg)
 
+# python train_model.py  --data-dir /home/sbk29/data/AR/train  --epochs 1 --vars TMQ --label-dir /home/sbk29/data/github_AR/AR_detection/u-net/ds_results
