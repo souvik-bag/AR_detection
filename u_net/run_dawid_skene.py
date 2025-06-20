@@ -142,7 +142,7 @@ class DawidSkeneModel:
     
     
     # where to write results
-OUTPUT_DIR = "/home/sbk29/data/github_AR/AR_detection/u-net/ds_results/test_val"
+OUTPUT_DIR = "/home/sbk29/data/github_AR/AR_detection/u-net/ds_results/validation"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 1) the worker function
@@ -224,7 +224,7 @@ def collate_var(batch):
 
 # 2) dispatch across cores
 if __name__ == "__main__":
-    ROOT = "/home/sbk29/data/AR/test_val"
+    ROOT = "/home/sbk29/data/AR/validation"
     VARS = ["TMQ"]
     ds   = ARMultiAnnDataset(ROOT, VARS)
     N    = len(ds)
